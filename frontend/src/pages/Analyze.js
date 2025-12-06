@@ -1,4 +1,4 @@
-import React, { useEffect, useState } from "react";
+import React, { useEffect, useState, useRef } from "react";
 import { useLocation } from "react-router-dom";
 import Pitchfinder from "pitchfinder";
 import {
@@ -22,6 +22,10 @@ export default function Analyze() {
   const [currentTime, setCurrentTime] = useState(0); 
   const [isPlaying, setIsPlaying] = useState(false);
 
+  // 애니메이션 루프 제어용 Ref 추가
+  const requestRef = useRef(); 
+  const isPlayingRef = useRef(false); // 루프 안에서 즉시 상태 확인용
+
   useEffect(() => {
     if (!file) return;
 
@@ -30,59 +34,99 @@ export default function Analyze() {
     reader.onload = async (e) => {
       try {
         const arrayBuffer = e.target.result;
-        const audioContext = new (window.AudioContext || window.webkitAudioContext)();
-        const audioBuffer = await audioContext.decodeAudioData(arrayBuffer);
-        const channelData = audioBuffer.getChannelData(0);
+        
+        // 1. 일단 오디오 디코딩 (원본 데이터)
+        const tempContext = new (window.AudioContext || window.webkitAudioContext)();
+        const originalBuffer = await tempContext.decodeAudioData(arrayBuffer);
 
+        // ----------------------------------------------------------------
+        // 🌪️ [핵심] 고주파 제거 필터링 (Low-Pass Filter)
+        // 분석 전에 5000Hz 이상의 소리를 물리적으로 삭제해버림
+        // ----------------------------------------------------------------
+        
+        // 오프라인 컨텍스트 생성 (소리를 내지 않고 고속으로 처리하는 전용 공간)
+        const offlineCtx = new OfflineAudioContext(
+          1, // 모노 채널로 변환 (분석엔 스테레오 필요 없음)
+          originalBuffer.length,
+          originalBuffer.sampleRate
+        );
+
+        // 소스 생성
+        const source = offlineCtx.createBufferSource();
+        source.buffer = originalBuffer;
+
+        // 필터 생성 (Lowpass, 5000Hz)
+        // -> 이러면 20,000Hz 잡음이 싹 사라져서 YIN 알고리즘이 헷갈리지 않음
+        const filter = offlineCtx.createBiquadFilter();
+        filter.type = "lowpass";
+        filter.frequency.value = 5000; // 피아노 최고음(약 4186Hz)보다 살짝 높게
+
+        // 연결: 소스 -> 필터 -> 목적지
+        source.connect(filter);
+        filter.connect(offlineCtx.destination);
+        source.start();
+
+        // 렌더링 시작 (필터 먹인 깨끗한 오디오 버퍼 생성)
+        const filteredBuffer = await offlineCtx.startRendering();
+        
+        // 이제 '깨끗해진' 데이터로 분석 시작
+        const channelData = filteredBuffer.getChannelData(0);
+
+        // ----------------------------------------------------------------
+        // 아래는 기존 로직과 동일 (단, audioContext는 재생용으로 따로 저장)
+        // ----------------------------------------------------------------
+        
+        // 재생을 위한 메인 컨텍스트 저장 (필터링 된 거 말고 원본을 재생해야 듣기 좋음)
+        setAudioBuffer(originalBuffer); 
+        setAudioContext(tempContext);
+
+        // Pitchfinder 설정
         const detectPitch = Pitchfinder.YIN({
-          sampleRate: audioContext.sampleRate,
-          threshold: 0.005,
+          sampleRate: offlineCtx.sampleRate,
+          threshold: 0.05,
         });
 
-        const frameSize = 2048;
-        const results = [];
+        const frameSize = 2048; 
+        const rawResults = [];
 
-        setAudioBuffer(audioBuffer);
-        setAudioContext(audioContext);
+        // 볼륨 체크용 (상대적 기준)
+        let globalMaxRms = 0;
+        for (let i = 0; i < channelData.length; i += 1000) {
+            const val = Math.abs(channelData[i]);
+            if (val > globalMaxRms) globalMaxRms = val;
+        }
+        const noiseThreshold = globalMaxRms * 0.08; 
 
+        // 분석 루프
         for (let i = 0; i < channelData.length; i += frameSize) {
-          const frame = channelData.slice(i, i + frameSize);  
+          const frame = channelData.slice(i, i + frameSize);
+          
+          const rms = Math.sqrt(frame.reduce((sum, val) => sum + (val * val), 0) / frame.length);
           const freq = detectPitch(frame);
+          const time = parseFloat((i / offlineCtx.sampleRate).toFixed(2));
 
-          // 50~5000Hz 범위를 벗어나면 무음(0) 취급하거나 null 처리
-          const isValid = freq && freq > 50 && freq < 5000;
-
-          if (isValid) {
-            results.push({
-              time: (i / audioContext.sampleRate).toFixed(2),
-              hz: freq,
-            });
+          // 5000 필터는 여기서도 유지 (이중 안전장치)
+          if (freq && freq > 25 && freq < 5000) {
+            rawResults.push({ time, hz: freq, rms });
           } else {
-            // 🔥 [수정 포인트 1] 
-            // 분석 단계에서 끊김을 확실히 표현하기 위해 
-            // 유효하지 않은 구간은 0을 넣거나 아예 건너뛸 수 있습니다.
-            // 여기서는 그래프 렌더링 시 null 처리를 위해 '0'으로 채워둡니다.
-            results.push({
-              time: (i / audioContext.sampleRate).toFixed(2),
-              hz: 0, 
-            });
-          } 
+            // 원래 20000Hz가 찍히던 구간이 이제는 
+            // 필터 덕분에 제대로 된 낮은 주파수(혹은 0)로 잡힐 것임
+            rawResults.push({ time, hz: 0, rms });
+          }
         }
 
-        if (results.length === 0) {
+        if (rawResults.length === 0) {
           alert("피치를 검출할 수 없습니다.");
           setLoading(false);
           return;
         }
 
-        // -------------------------
-        // ✨ [추가] 짧은 끊김 보정 로직 적용
-        // -------------------------
-        const smoothResults = fillShortGaps(results, 20);
+        // 필터링 및 통계 처리 (기존과 동일)
+        const filteredData = applySmartFilters(rawResults, noiseThreshold);
+        const smoothedData = fillShortGaps(filteredData, 12); 
 
-        // 통계 계산 시 보정된 데이터 사용
-        const freqs = smoothResults.map((v) => v.hz).filter(hz => hz > 0);
-        
+        // ... (통계 계산 로직)
+        const freqs = smoothedData.map((v) => v.hz).filter(hz => hz > 0);
         if (freqs.length > 0) {
             const min = Math.min(...freqs).toFixed(1);
             const max = Math.max(...freqs).toFixed(1);
@@ -91,15 +135,13 @@ export default function Analyze() {
             setMaxHz(max);
             setAvgHz(avg);
         } else {
-            // 유효한 피치가 하나도 없을 경우
             setMinHz(0); setMaxHz(0); setAvgHz(0);
         }
 
-        setData(smoothResults);
+        setData(smoothedData);
 
       } catch (err) {
-        console.error("파일 분석 오류:", err);
-        alert("파일 분석 중 오류가 발생했습니다.");
+        console.error("오류:", err);
       } finally {
         setLoading(false);
       }
@@ -108,77 +150,151 @@ export default function Analyze() {
     reader.readAsArrayBuffer(file);
   }, [file]);
 
-  const play = () => {
-    if (!audioContext || !audioBuffer) return;
-    if (sourceNode) sourceNode.stop();
+  // --- [핵심 함수 1] 스마트 필터 ---
+  const applySmartFilters = (data, threshold) => {
+    let processed = data.map(d => ({ ...d }));
 
-    const newSource = audioContext.createBufferSource();
-    newSource.buffer = audioBuffer;
-    newSource.connect(audioContext.destination);
-    newSource.start(0, currentTime);
+    // 고주파 노이즈 제거
+    processed = processed.map(p => {
+      if (p.hz > 1500 && p.rms < threshold) return { ...p, hz: 0 };
+      return p;
+    });
 
-    const startAt = audioContext.currentTime - currentTime;
+    // 미디언 필터 (튀는 값 제거)
+    const windowSize = 100; 
+    const half = Math.floor(windowSize / 2);
+    
+    const medianFiltered = processed.map((item, i, arr) => {
+      if (i < half || i >= arr.length - half) return item;
+      if (item.hz === 0) return item;
 
-    const update = () => {
-      const t = audioContext.currentTime - startAt;
-      setCurrentTime(t);
-      if (t < audioBuffer.duration && isPlaying) {
-        requestAnimationFrame(update);
+      const windowVals = [];
+      for (let j = -half; j <= half; j++) {
+        if (arr[i+j].hz > 0) windowVals.push(arr[i+j].hz);
       }
-    };
-    requestAnimationFrame(update);
 
-    setSourceNode(newSource);
-    setIsPlaying(true);
+      if (windowVals.length < 3) return item;
+
+      windowVals.sort((a, b) => a - b);
+      const median = windowVals[Math.floor(windowVals.length / 2)];
+
+      if (Math.abs(item.hz - median) > median * 0.5) {
+         return { ...item, hz: median }; 
+      }
+      return item;
+    });
+
+    return medianFiltered;
   };
 
-  const pause = () => {
-    if (sourceNode) sourceNode.stop();
-    setIsPlaying(false);
-  };
-
-  // 🔥 [수정 포인트 2] 렌더링 직전에 데이터 변환 (0 -> null)
-  // 이렇게 해야 차트 전체(Y축 포함)가 null을 인식하고 올바르게 줌인(Zoom-in)합니다.
-  const chartData = data.map((d) => ({
-    ...d,
-    hz: d.hz <= 0 ? null : d.hz, // 0 이하는 null로 변환
-  }));
-
+  // --- [핵심 함수 2] 끊김 보정 ---
   const fillShortGaps = (data, maxGapFrame) => {
-    const processed = [...data];
+    const processed = data.map(item => ({ ...item }));
     let lastValidHz = null;
     let gapIndices = [];
 
     for (let i = 0; i < processed.length; i++) {
       const currentHz = processed[i].hz;
-
-      if (currentHz > 0) {
-        // 유효한 값이 나왔을 때
+      if (currentHz && currentHz > 0) {
         if (gapIndices.length > 0) {
-          // 갭이 허용 범위 이내이고, 이전 유효 값이 있다면 채움
           if (gapIndices.length <= maxGapFrame && lastValidHz !== null) {
-            for (const index of gapIndices) {
-              processed[index].hz = lastValidHz;
-            }
+            for (const index of gapIndices) processed[index].hz = lastValidHz;
           }
-          gapIndices = []; // 갭 초기화
+          gapIndices = [];
         }
-        lastValidHz = currentHz; // 마지막 유효 값 갱신
+        lastValidHz = currentHz;
       } else {
-        // 값이 0이면 인덱스 적립
         gapIndices.push(i);
       }
     }
-    
     return processed;
   };
 
+  const play = () => {
+    if (!audioContext || !audioBuffer) return;
+    
+    // 이미 재생 중이면 중복 실행 방지
+    if (isPlayingRef.current) return;
+
+    if (sourceNode) sourceNode.stop();
+
+    const newSource = audioContext.createBufferSource();
+    newSource.buffer = audioBuffer;
+    newSource.connect(audioContext.destination);
+    
+    // 현재 시점부터 재생
+    newSource.start(0, currentTime);
+
+    // 재생 시작 시간 계산
+    const startAt = audioContext.currentTime - currentTime;
+
+    // 상태 동기화
+    setIsPlaying(true);
+    isPlayingRef.current = true; // Ref도 true로
+
+    const update = () => {
+      // 루프 안에서는 Ref를 바라봐야 멈추지 않음
+      if (!isPlayingRef.current) return;
+
+      const t = audioContext.currentTime - startAt;
+      
+      // 버퍼 길이 넘어가면 정지
+      if (t >= audioBuffer.duration) {
+        pause();
+        setCurrentTime(0); // 끝나면 0초로
+        return;
+      }
+
+      setCurrentTime(t);
+      requestRef.current = requestAnimationFrame(update);
+    };
+
+    requestRef.current = requestAnimationFrame(update);
+    setSourceNode(newSource);
+  };
+
+  const pause = () => {
+    if (sourceNode) {
+      try {
+        sourceNode.stop();
+      } catch (e) {
+        // 이미 멈춘 경우 무시
+      }
+    }
+    
+    // 루프 취소
+    if (requestRef.current) {
+      cancelAnimationFrame(requestRef.current);
+    }
+
+    setIsPlaying(false);
+    isPlayingRef.current = false; // Ref false로 변경하여 루프 탈출
+  };
+
+  // 컴포넌트가 사라질 때(언마운트) 정리
+  useEffect(() => {
+    return () => {
+      if (requestRef.current) cancelAnimationFrame(requestRef.current);
+      if (sourceNode) {
+        try { sourceNode.stop(); } catch(e) {}
+      }
+    };
+  }, []); // 의존성 배열 비움
+
+  // 차트 데이터 변환 (0 -> null)
+  const chartData = data.map((d) => ({
+    ...d,
+    hz: d.hz <= 0 ? null : d.hz,
+  }));
+
+  // --- [UI 렌더링] ---
   return (
     <div style={styles.container}>
+      {/* 1. 제목 및 파일명 */}
       <h1 style={styles.title}>📊 File Pitch Analysis</h1>
-
       {file && <p style={styles.filename}>분석 파일: <b>{file.name}</b></p>}
 
+      {/* 2. 로딩바 */}
       {loading && (
         <div style={styles.loadingBox}>
           <div className="spinner" style={styles.spinner}></div>
@@ -186,6 +302,7 @@ export default function Analyze() {
         </div>
       )}
 
+      {/* 3. 분석 결과 박스 */}
       {!loading && minHz && (
         <div style={styles.infoBox}>
           <p>최저 Hz: {minHz}</p>
@@ -194,56 +311,64 @@ export default function Analyze() {
         </div>
       )}
 
+      {/* 4. 재생 컨트롤 및 그래프 */}
       {!loading && data.length > 0 && (
-        <div style={{ marginBottom: "20px" }}>
-          {!isPlaying ? (
-            <button onClick={play}>▶ 재생</button>
-          ) : (
-            <button onClick={pause}>⏸ 일시정지</button>
-          )}
-        </div>
-      )}
-
-      {!loading && data.length > 0 && (
-        <ResponsiveContainer width="95%" height={400}>
-          {/* 🔥 [수정 포인트 3] LineChart에 변환된 chartData 주입 */}
-          <LineChart 
-            data={chartData}
-            onClick={(e) => {
-              if (e && e.activeLabel) {
-                setCurrentTime(parseFloat(e.activeLabel));
-              }
-            }}
-          >
-            {/* 🔥 [수정 포인트 4] YAxis 도메인을 'auto'로 설정하여 줌인 효과 적용 */}
-            <YAxis 
-                domain={['auto', 'auto']} 
-                tickCount={10} 
-                width={40}
-            />
-            
-            <XAxis dataKey="time" />
-            <Tooltip />
-            <ReferenceLine x={currentTime.toFixed(2)} stroke="red" />
-
-            {/* 🔥 [수정 포인트 5] connectNulls={false} 적용 */}
-            <Line 
-              type="monotone" 
-              dataKey="hz" 
-              stroke="#FFD940" 
-              dot={false} 
-              connectNulls={false} // 무음 구간(null)은 선을 잇지 않음
-              isAnimationActive={false}
-            />
-          </LineChart>
-        </ResponsiveContainer>
+        <>
+          <div style={{ marginBottom: "20px" }}>
+            {!isPlaying ? (
+              <button onClick={play} style={styles.button}>▶ 재생</button>
+            ) : (
+              <button onClick={pause} style={styles.button}>⏸ 일시정지</button>
+            )}
+          </div>
+          
+          <ResponsiveContainer width="95%" height={400}>
+            <LineChart 
+              data={chartData}
+              onClick={(e) => {
+                if (e && e.activeLabel) {
+                  const clickedTime = parseFloat(e.activeLabel);
+                  setCurrentTime(clickedTime);
+                  // 재생 중 이동 시 바로 반영을 위해
+                  if (isPlaying) {
+                     pause(); // 잠깐 멈췄다 다시 재생하거나, UX에 따라 결정
+                     // 여기서는 간단히 멈춤 처리 (사용자가 다시 재생 누르게)
+                  }
+                }
+              }}
+            >
+              <YAxis 
+                  domain={['auto', 'auto']} 
+                  tickCount={10} 
+                  width={40}
+              />
+              <XAxis dataKey="time" />
+              <Tooltip />
+              {/* 6. 빨간 선: x값에 숫자를 그대로 넣어야 정확하게 매칭됨 */}
+              <ReferenceLine 
+                x={currentTime} 
+                stroke="red" 
+                strokeWidth={2}
+                isFront={true} // 라인이 데이터보다 앞에 오게
+                ifOverflow="visible" // 차트 밖으로 나가도 보이게 (안전장치)
+              />
+              <Line 
+                type="monotone" 
+                dataKey="hz" 
+                stroke="#FFD940" 
+                dot={false} 
+                connectNulls={false} 
+                isAnimationActive={false}
+              />
+            </LineChart>
+          </ResponsiveContainer>
+        </>
       )}
     </div>
   );
 }
 
 const styles = {
-  // ... (기존 스타일과 동일)
   container: {
     padding: "50px",
     textAlign: "center",
@@ -271,7 +396,18 @@ const styles = {
     display: "inline-block",
     marginBottom: "30px",
     fontSize: "18px",
+    lineHeight: "1.6",
   },
+  button: {
+    padding: "10px 20px",
+    fontSize: "16px",
+    cursor: "pointer",
+    borderRadius: "5px",
+    border: "none",
+    backgroundColor: "#FFD940",
+    color: "#0D1B3D",
+    fontWeight: "bold"
+  }
 };
 
 const styleSheet = document.styleSheets[0];
